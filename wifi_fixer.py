@@ -365,6 +365,7 @@ table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px 6px;
 <div class="card"><h3 style="margin-top:0">⚡ Boost a download</h3><div class="hint" style="margin:0 0 10px">Pick the app that's downloading. It gets high priority, background sync/update apps (OneDrive, Dropbox, Steam…) are paused and other heavy apps are slowed. Hit Restore when you're done.</div>
 <div class="row" style="margin-bottom:10px"><button class="g" onclick="loadProcs()">Show running apps</button><label style="margin:0 8px"><input type="checkbox" id="pz" checked style="width:auto"> Pause background hogs</label><button class="g" onclick="restore()">↩️ Restore everything</button></div>
 <div style="overflow-x:auto"><table id="pr"></table></div></div>
+<div class="hint" style="text-align:center;margin-top:28px">Made by <a href="https://averybeuth.xyz" target="_blank" style="color:#a5b4fc">averybeuth.xyz</a></div>
 </main><script>
 const $=s=>document.querySelector(s),h=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e};
 const api=(p,b)=>fetch(p,b===undefined?{}:{method:"POST",headers:{"X-WF":"1","Content-Type":"application/json"},body:JSON.stringify(b)}).then(r=>r.json());
