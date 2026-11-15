@@ -25,7 +25,7 @@ def save(d): json.dump(d, open(DB, "w"))
 def run(cmd, t=15):
     try: return subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=t, creationflags=NOWIN).stdout
     except Exception: return ""
-def step(s): JOB["step"] = s
+def step(s): JOB["step"] = s; JOB["i"] = JOB.get("i", -1) + 1
 
 def local_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -91,7 +91,7 @@ def download(secs=8, threads=4):
                         total[0] += len(b)
             except Exception: time.sleep(.2)
     t0 = time.time(); ths = [threading.Thread(target=w) for _ in range(threads)]
-    [t.start() for t in ths]; [t.join() for t in ths]
+    meter("download", total, ths, t0)
     return total[0] * 8 / 1e6 / (time.time() - t0) if total[0] else None
 
 def upload(secs=6, threads=3):
@@ -102,7 +102,7 @@ def upload(secs=6, threads=3):
                 urllib.request.urlopen(urllib.request.Request("https://speed.cloudflare.com/__up", data=data, headers=UA), timeout=10).read(); sent[0] += len(data)
             except Exception: time.sleep(.2)
     t0 = time.time(); ths = [threading.Thread(target=w) for _ in range(threads)]
-    [t.start() for t in ths]; [t.join() for t in ths]
+    meter("upload", sent, ths, t0)
     return sent[0] * 8 / 1e6 / (time.time() - t0) if sent[0] else None
 
 def norm(mac): return ":".join(x.zfill(2).lower() for x in re.split(r"[:-]", mac))
@@ -275,6 +275,60 @@ def watchdog():
         time.sleep(5)
         if time.time() - LAST[0] > 120 and not JOB["running"]: restore(); os._exit(0)
 
+def meter(phase, counter, ths, t0):
+    for t in ths: t.start()
+    raw, series, last = [], [], (t0, 0)
+    while any(t.is_alive() for t in ths):
+        time.sleep(.25); now, b = time.time(), counter[0]
+        raw.append((b - last[1]) * 8 / 1e6 / max(now - last[0], .01)); last = (now, b)
+        series.append(round(sum(raw[-4:]) / len(raw[-4:]), 1))
+        JOB["live"] = {"phase": phase, "mbps": series[-1], "series": series}
+
+LIVE = {"down": 0, "up": 0, "hist": [], "apps": []}
+
+def io_total(p):
+    io = p.io_counters()
+    if OS == "Windows": return io.read_bytes + io.write_bytes + getattr(io, "other_bytes", 0)
+    return getattr(io, "read_chars", 0) + getattr(io, "write_chars", 0)
+
+def app_share(prev, total):
+    conns = {}
+    try:
+        for c in psutil.net_connections("inet"):
+            if c.pid and c.status == "ESTABLISHED": conns[c.pid] = conns.get(c.pid, 0) + 1
+    except Exception: pass
+    now, agg, cur = time.time(), {}, {}
+    for p in psutil.process_iter(["pid", "name"]):
+        pid = p.info["pid"]
+        if pid not in conns: continue
+        try: t = io_total(p)
+        except Exception: t = None
+        cur[pid] = (t, now); rate = 0
+        if t is not None and pid in prev and prev[pid][0] is not None: rate = max(0, (t - prev[pid][0]) / max(now - prev[pid][1], .1))
+        nm = p.info["name"] or "?"
+        a = agg.setdefault(nm, {"name": nm, "pid": pid, "w": 0, "best": -1, "conns": 0, "hog": any(h in nm.lower() for h in HOGS)})
+        a["w"] += rate; a["conns"] += conns[pid]
+        if rate > a["best"]: a["best"], a["pid"] = rate, pid
+    prev.clear(); prev.update(cur)
+    tw = sum(a["w"] for a in agg.values()); key = "w"
+    if tw <= 0: tw, key = sum(a["conns"] for a in agg.values()) or 1, "conns"
+    out = [{"name": a["name"], "pid": a["pid"], "pct": round(100 * a[key] / tw, 1), "mbps": round(total * a[key] / tw, 2), "conns": a["conns"], "hog": a["hog"]} for a in agg.values()]
+    return sorted(out, key=lambda x: (-x["pct"], -x["conns"]))[:12]
+
+def sampler():
+    if not psutil: return
+    last, lt, prev, tick = psutil.net_io_counters(), time.time(), {}, 0
+    while True:
+        time.sleep(1)
+        try:
+            n, now = psutil.net_io_counters(), time.time(); dt = max(now - lt, .1)
+            d, u = (n.bytes_recv - last.bytes_recv) * 8 / 1e6 / dt, (n.bytes_sent - last.bytes_sent) * 8 / 1e6 / dt
+            last, lt = n, now
+            LIVE["hist"] = (LIVE["hist"] + [[round(d, 2), round(u, 2)]])[-60:]; LIVE["down"], LIVE["up"] = round(d, 2), round(u, 2)
+            tick += 1
+            if tick % 2 == 0: LIVE["apps"] = app_share(prev, d + u)
+        except Exception: pass
+
 def full(target):
     gw = gateway(); r = {"target": target, "gateway": gw}
     step("Reading WiFi signal…"); r["wifi"] = wifi()
@@ -291,7 +345,7 @@ def full(target):
     save(db); return r
 
 def start(kind, fn):
-    JOB.update(running=True, kind=kind, step="Starting…", result=None, error=None)
+    JOB.update(running=True, kind=kind, step="Starting…", result=None, error=None, i=0 if kind == "scan" else -1, live={})
     def w():
         try: JOB["result"] = fn()
         except Exception as e: JOB["error"] = str(e)
@@ -314,6 +368,7 @@ class H(BaseHTTPRequestHandler):
         elif self.path == "/api/state": db = load(); self.reply({"target": db.get("target", 100), "history": db.get("history", [])[-20:]})
         elif self.path == "/api/job": self.reply(JOB)
         elif self.path == "/api/ping": self.reply({})
+        elif self.path == "/api/live": self.reply({"ok": bool(psutil), "live": LIVE})
         elif self.path == "/api/procs": self.reply(procs())
         else: self.reply({}, code=404)
     def do_POST(self):
@@ -339,33 +394,56 @@ class H(BaseHTTPRequestHandler):
 
 PAGE = r"""<!doctype html><html><head><meta charset="utf-8"><title>WiFi Fixer</title><meta name="viewport" content="width=device-width,initial-scale=1">
 <style>
-:root{--bg:#0f1420;--card:#192034;--tx:#e8ecf6;--mu:#8b95b0;--ok:#34d399;--warn:#fbbf24;--bad:#f87171;--ac:#6366f1}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font:15px system-ui,sans-serif}
-main{max-width:880px;margin:0 auto;padding:24px 16px 60px}h1{margin:0 0 4px}p.sub{color:var(--mu);margin:0 0 20px}
-.card{background:var(--card);border-radius:14px;padding:16px;margin-bottom:16px}
-.row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}label{font-size:12px;color:var(--mu);display:block;margin-bottom:4px}
-input{background:#0f1420;border:1px solid #2b3552;color:var(--tx);border-radius:8px;padding:10px;font-size:16px;width:140px}
-button{background:var(--ac);color:#fff;border:0;border-radius:8px;padding:10px 16px;font-size:15px;cursor:pointer}button.g{background:#2b3552}button:disabled{opacity:.5}
-.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}.tile{background:#0f1420;border-radius:10px;padding:12px;border-left:4px solid #2b3552}
-.tile.ok{border-color:var(--ok)}.tile.warn{border-color:var(--warn)}.tile.bad{border-color:var(--bad)}.lbl{font-size:12px;color:var(--mu)}.val{font-size:28px;font-weight:700}.unit{font-size:12px;color:var(--mu)}
-.f{border-left:4px solid;padding:8px 12px;margin:8px 0;background:#0f1420;border-radius:6px}.f.ok{border-color:var(--ok)}.f.warn{border-color:var(--warn)}.f.bad{border-color:var(--bad)}.f b{display:block}.f small{color:var(--mu)}.f i{display:block;margin-top:4px;font-style:normal;color:#c7d2fe}
-table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:8px 6px;border-bottom:1px solid #2b3552;font-size:13px}th{color:var(--mu);font-weight:500}
-.tag{padding:2px 8px;border-radius:99px;font-size:12px}.tag.ok{background:#064e3b}.tag.unk{background:#78350f}.tag.me{background:#312e81}
-#bar{color:var(--warn);margin-top:10px;min-height:20px}.hint{color:var(--mu);font-size:13px;margin-top:10px}[hidden]{display:none}
+:root{--bg:#fff;--fg:#0a0a0a;--mu:#737373;--line:#e5e5e5;--soft:#f5f5f5}
+@media(prefers-color-scheme:dark){:root{--bg:#0a0a0a;--fg:#fafafa;--mu:#a3a3a3;--line:#262626;--soft:#171717}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 -apple-system,"Segoe UI",Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}
+main{max-width:860px;margin:0 auto;padding:48px 24px 72px}
+h1{font-size:28px;font-weight:600;letter-spacing:-.02em;margin:0 0 6px}h1 small{font-size:12px;font-weight:400;color:var(--mu);margin-left:6px}
+h3{font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;margin:0 0 16px}
+p.sub{color:var(--mu);margin:0 0 32px}.sub{color:var(--mu);font-weight:400;letter-spacing:0;text-transform:none}
+.card{border-top:1px solid var(--line);padding:28px 0}.card:first-of-type{border:0;padding-top:0}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:flex-end}
+label{font-size:12px;color:var(--mu);display:block;margin-bottom:6px}
+input[type=number]{background:transparent;border:1px solid var(--fg);color:var(--fg);border-radius:6px;padding:9px 12px;font-size:15px;width:150px;outline:0}
+button{background:var(--fg);color:var(--bg);border:1px solid var(--fg);border-radius:6px;padding:9px 16px;font-size:14px;cursor:pointer}
+button:hover{opacity:.85}button.g{background:transparent;color:var(--fg);border-color:var(--line)}button.g:hover{border-color:var(--fg);opacity:1}button:disabled{opacity:.4;cursor:default}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.tile{background:var(--bg);padding:16px}.tile.bad{background:var(--fg);color:var(--bg)}.tile.warn .val{text-decoration:underline;text-underline-offset:6px}
+.lbl{font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--mu)}.unit{font-size:12px;color:var(--mu)}.tile.bad .lbl,.tile.bad .unit{color:inherit;opacity:.7}
+.val{font-size:30px;font-weight:600;letter-spacing:-.02em;margin:4px 0 2px}
+.f{padding:14px 0;border-bottom:1px solid var(--line)}.f:last-child{border:0}.f b{display:block;margin-bottom:2px}.f small{color:var(--mu);font-size:14px}.f i{display:block;margin-top:6px;font-style:normal}
+table{width:100%;border-collapse:collapse}td,th{text-align:left;padding:12px 8px 12px 0;border-bottom:1px solid var(--line);font-size:13px}th{color:var(--mu);font-weight:500;font-size:11px;letter-spacing:.06em;text-transform:uppercase}
+.tag{padding:2px 9px;border-radius:99px;font-size:12px;border:1px solid var(--fg);white-space:nowrap}.tag.unk{background:var(--fg);color:var(--bg)}.tag.me{border-color:var(--line);background:var(--soft)}
+#bar{margin-top:14px;min-height:20px;color:var(--mu)}.hint{color:var(--mu);font-size:13px;margin-top:12px}[hidden]{display:none}
+.big{font-size:44px;font-weight:600;letter-spacing:-.03em;line-height:1.1;font-variant-numeric:tabular-nums}
+.verdict{font-size:22px;font-weight:600;letter-spacing:-.02em;margin-bottom:16px}
+.tgrid{display:grid;grid-template-columns:1fr 1.5fr;gap:32px}@media(max-width:640px){.tgrid{grid-template-columns:1fr}}
+#steps{list-style:none;margin:0;padding:0}#steps li{padding:5px 0 5px 26px;position:relative;color:var(--mu);transition:color .3s}
+#steps li::before{content:"";position:absolute;left:0;top:11px;width:12px;height:12px;border-radius:50%;border:1.5px solid var(--mu);transition:all .3s}
+#steps li.done{color:var(--fg)}#steps li.done::before{background:var(--fg);border-color:var(--fg)}
+#steps li.act{color:var(--fg);font-weight:600}#steps li.act::before{border-color:var(--fg);animation:pulse 1.1s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 var(--mu)}100%{box-shadow:0 0 0 8px transparent}}
+#res{transition:opacity .3s}.dim{opacity:.3}.fade{animation:in .45s ease both}@keyframes in{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+#tcard{animation:in .35s ease both}
+#apps{display:flex;flex-direction:column}.arow{display:grid;grid-template-columns:minmax(120px,1.4fr) 2fr 84px 64px auto;gap:12px;align-items:center;padding:9px 0;border-bottom:1px solid var(--line);font-size:13px}
+.arow button{padding:4px 12px;font-size:12px}.track{height:6px;background:var(--line);border-radius:3px;overflow:hidden}.fill{height:100%;background:var(--fg);width:0;transition:width .8s ease}
+.am{text-align:right;font-variant-numeric:tabular-nums}.ac{color:var(--mu)}svg{display:block}
 </style></head><body><main>
-<h1>📶 WiFi Fixer <small style="font-size:12px;color:var(--mu)">v2.1</small></h1><p class="sub">Test your speed, find out why it's slow, and see who's on your network.</p>
+<h1>WiFi Fixer <small>v2.1</small></h1><p class="sub">Test your speed, find out why it's slow, and see who's on your network.</p>
 <div class="card"><div class="row"><div><label>Speed you SHOULD be getting (Mbps)</label><input id="target" type="number" min="1" value="100"></div>
-<button id="go" onclick="run('full')">Run full check</button><button class="g" id="sc" onclick="run('scan')">Scan devices only</button><button class="g" onclick="flush()">Flush DNS</button><button onclick="fix()" style="background:#059669">🔧 Fix it for me</button><button class="g" onclick="report()">📄 Save report</button><button class="g" onclick="api('/api/quit',{});document.body.textContent='WiFi Fixer closed. You can close this window.'">Quit</button></div>
+<button id="go" onclick="run('full')">Run full check</button><button class="g" id="sc" onclick="run('scan')">Scan devices only</button><button class="g" onclick="flush()">Flush DNS</button><button onclick="fix()">Fix it for me</button><button class="g" onclick="report()">Save report</button><button class="g" onclick="api('/api/quit',{});document.body.textContent='WiFi Fixer closed. You can close this window.'">Quit</button></div>
 <div id="bar"></div><div class="hint" id="out" style="white-space:pre-line"></div><div class="hint" id="hist"></div></div>
-<div id="res" hidden><div class="card"><div class="tiles" id="stats"></div></div>
+<div class="card" id="tcard" hidden><h3>Running test</h3><div class="tgrid"><ul id="steps"></ul><div><div class="lbl" id="phase">Speed test</div><div class="big" id="liveval">--</div><div class="unit">Mbps</div><div id="livechart" style="margin-top:10px"></div></div></div></div>
+<div class="card"><h3>Live network</h3><div class="row" style="gap:40px"><div><div class="lbl">Download</div><div class="big" id="ld">--</div><div class="unit">Mbps</div></div><div><div class="lbl">Upload</div><div class="big" id="lu">--</div><div class="unit">Mbps</div></div></div><div id="lchart" style="margin-top:14px"></div><div class="hint" id="lnote">Last 60 seconds. Solid line is download, dashed is upload.</div></div>
+<div id="res" hidden><div class="card"><div id="verdict" class="verdict"></div><div class="tiles" id="stats"></div></div>
 <div class="card" id="fcard"><h3 style="margin-top:0">Diagnosis</h3><div id="finds"></div></div>
 <div class="card"><h3 style="margin-top:0">Devices on your WiFi <span id="dc" class="sub"></span></h3><div style="overflow-x:auto"><table id="dev"></table></div>
 <div class="hint">Phones often use a private/random MAC address, so your own phone can show up as "unknown" until you mark it. Mark every device you recognise; anything left over is worth investigating. This tool shows devices that are connected, not what they're doing online.</div>
-<div class="hint" id="adv" hidden>⚠️ Found something you don't recognise? Log into your router (usually 192.168.0.1 or 192.168.1.1), change the WiFi password to a strong WPA2/WPA3 one, turn off WPS, then reconnect your own devices.</div></div></div>
-<div class="card"><h3 style="margin-top:0">⚡ Boost a download</h3><div class="hint" style="margin:0 0 10px">Pick the app that's downloading. It gets high priority, background sync/update apps (OneDrive, Dropbox, Steam…) are paused and other heavy apps are slowed. Hit Restore when you're done.</div>
-<div class="row" style="margin-bottom:10px"><button class="g" onclick="loadProcs()">Show running apps</button><label style="margin:0 8px"><input type="checkbox" id="pz" checked style="width:auto"> Pause background hogs</label><button class="g" onclick="restore()">↩️ Restore everything</button></div>
-<div style="overflow-x:auto"><table id="pr"></table></div></div>
-<div class="hint" style="text-align:center;margin-top:28px">Made by <a href="https://averybeuth.xyz" target="_blank" style="color:#a5b4fc">averybeuth.xyz</a></div>
+<div class="hint" id="adv" hidden>Found something you don't recognise? Log into your router (usually 192.168.0.1 or 192.168.1.1), change the WiFi password to a strong WPA2/WPA3 one, turn off WPS, then reconnect your own devices.</div></div></div>
+<div class="card"><h3>Network allocation by app</h3><div class="hint" style="margin:0 0 12px">Which apps are using your connection right now. Windows does not report exact per-app network use, so shares are estimated from each app's activity and open connections. Boost gives an app high priority, pauses background sync and update apps and slows other heavy apps.</div>
+<div id="apps"></div><div class="row" style="margin-top:16px;align-items:center"><label style="margin:0;display:flex;align-items:center;gap:6px;color:var(--fg)"><input type="checkbox" id="pz" checked style="width:auto">Pause background sync and update apps</label><button class="g" onclick="restore()">Restore everything</button></div></div>
+<div class="hint" style="text-align:center;margin-top:28px">Made by <a href="https://averybeuth.xyz" target="_blank" style="color:inherit;text-decoration:underline">averybeuth.xyz</a></div>
 </main><script>
 const $=s=>document.querySelector(s),h=(t,c,x)=>{const e=document.createElement(t);if(c)e.className=c;if(x!==undefined)e.textContent=x;return e};
 const api=(p,b)=>fetch(p,b===undefined?{}:{method:"POST",headers:{"X-WF":"1","Content-Type":"application/json"},body:JSON.stringify(b)}).then(r=>r.json());
@@ -374,28 +452,30 @@ function loadState(){api("/api/state").then(s=>{if(!$("#target").dataset.set){$(
 function spark(H){const el=$("#hist");el.replaceChildren();H=H.filter(x=>x.down);if(H.length<2){el.textContent=H.length?"Last test: "+H[0].down.toFixed(0)+" Mbps":"";return}
  const m=Math.max(...H.map(x=>x.down),1),W=300,T=50,pts=H.map((x,i)=>(i*W/(H.length-1)).toFixed(0)+","+(T-x.down/m*(T-4)-2).toFixed(0)).join(" ");
  const NS="http://www.w3.org/2000/svg",sv=document.createElementNS(NS,"svg"),pl=document.createElementNS(NS,"polyline");sv.setAttribute("viewBox","0 0 "+W+" "+T);sv.setAttribute("width","300");
- pl.setAttribute("points",pts);pl.setAttribute("fill","none");pl.setAttribute("stroke","#6366f1");pl.setAttribute("stroke-width","2");sv.append(pl);
+ pl.setAttribute("points",pts);pl.setAttribute("fill","none");pl.setAttribute("stroke","currentColor");pl.setAttribute("stroke-width","2");sv.append(pl);
  el.append("Download history (last "+H.length+" tests, best "+m.toFixed(0)+" Mbps)",document.createElement("br"),sv)}
 loadState();
 function report(){if(!LASTR){out("Run a full check first, then save the report.");return}const r=LASTR,f=(x,n=0)=>x==null?"n/a":x.toFixed(n);
  const L=["WiFi Fixer report - "+new Date().toLocaleString(),"","Download: "+f(r.down,1)+" Mbps (target "+r.target+")","Upload: "+f(r.up,1)+" Mbps","Internet ping: "+f(r.net_ping.avg)+" ms, loss "+r.net_ping.loss+"%","","Diagnosis:",...r.findings.map(x=>"- ["+x.level+"] "+x.title+": "+x.detail+(x.fix?" Fix: "+x.fix:"")),"","Devices:",...DEV.map(d=>"- "+d.ip+"  "+d.mac+"  "+(d.name||d.host||"?")+(d.me||d.router||d.name?"":"  (UNKNOWN)"))];
  const a=h("a");a.href=URL.createObjectURL(new Blob([L.join("\n")],{type:"text/plain"}));a.download="wifi-report.txt";a.click()}
 async function run(mode){const r=await api("/api/run",{mode,target:$("#target").value});if(r.busy)return;
- $("#go").disabled=$("#sc").disabled=true;timer=setInterval(poll,700)}
-async function poll(){const j=await api("/api/job");$("#bar").textContent=j.running?"⏳ "+j.step:"";
+ $("#go").disabled=$("#sc").disabled=true;timer=setInterval(poll,350)}
+async function poll(){const j=await api("/api/job");testUI(j);
  if(j.running)return;clearInterval(timer);$("#go").disabled=$("#sc").disabled=false;
  if(j.error){$("#bar").textContent="Error: "+j.error;return}
  if(j.kind==="scan"){$("#res").hidden=false;$("#stats").parentElement.hidden=$("#fcard").hidden=true;DEV=j.result;devs()}
  else{$("#stats").parentElement.hidden=$("#fcard").hidden=false;render(j.result);loadState()}}
 function tile(l,v,u,c){const d=h("div","tile "+(c||""));d.append(h("div","lbl",l),h("div","val",v),h("div","unit",u));$("#stats").append(d)}
-function render(r){LASTR=r;$("#res").hidden=false;$("#stats").replaceChildren();const f=(x,n=0)=>x==null?"–":x.toFixed(n),pct=r.down?r.down/r.target:0;
+function render(r){LASTR=r;const q=r.down&&r.target?r.down/r.target:0;
+ $("#verdict").textContent=!r.down?"No internet connection detected.":q>=.85?"Your connection is running as expected.":"Your connection is running at "+Math.round(q*100)+"% of your target speed.";
+ const rs=$("#res");rs.classList.remove("fade");void rs.offsetWidth;rs.classList.add("fade");$("#res").hidden=false;$("#stats").replaceChildren();const f=(x,n=0)=>x==null?"–":x.toFixed(n),pct=r.down?r.down/r.target:0;
  tile("Download",f(r.down),"Mbps · target "+r.target,pct>=.85?"ok":pct>=.5?"warn":"bad");tile("Upload",f(r.up),"Mbps");
  tile("Internet ping",f(r.net_ping.avg),"ms · jitter "+f(r.net_ping.jitter)+" · loss "+r.net_ping.loss+"%");
  tile("Router ping",r.gw_ping?f(r.gw_ping.avg):"–","ms"+(r.gw_ping?" · loss "+r.gw_ping.loss+"%":""));
  tile("WiFi signal",r.wifi.signal!=null?r.wifi.signal+"%":"–",(r.wifi.channel?"channel "+r.wifi.channel:"")+(r.wifi.rate?" · "+r.wifi.rate+" Mbps link":""));
  tile("DNS lookup",f(r.dns),"ms");
  if(r.sys){tile("CPU",f(r.sys.cpu),"% used",r.sys.cpu>85?"bad":"ok");tile("Memory",f(r.sys.ram),"% used",r.sys.ram>90?"bad":"ok");tile("Disk",f(r.sys.disk),"% full",r.sys.disk>95?"bad":"ok")}
- const F=$("#finds");F.replaceChildren();for(const x of r.findings){const d=h("div","f "+x.level);d.append(h("b","",x.title),h("small","",x.detail));if(x.fix)d.append(h("i","","🔧 "+x.fix));F.append(d)}
+ const F=$("#finds");F.replaceChildren();for(const x of r.findings){const d=h("div","f "+x.level);d.append(h("b","",{bad:"Problem - ",warn:"Warning - ",ok:"OK - "}[x.level]+x.title),h("small","",x.detail));if(x.fix)d.append(h("i","","Fix: "+x.fix));F.append(d)}
  DEV=r.devices;devs()}
 function devs(){const t=$("#dev");t.replaceChildren();const hr=h("tr");["IP","Device","MAC","Status",""].forEach(x=>hr.append(h("th","",x)));t.append(hr);let unk=0;
  for(const d of DEV){const tr=h("tr");const trusted=d.me||d.router||d.name;if(!trusted)unk++;
@@ -406,13 +486,29 @@ function devs(){const t=$("#dev");t.replaceChildren();const hr=h("tr");["IP","De
  $("#dc").textContent="· "+DEV.length+" found, "+unk+" unknown";$("#adv").hidden=!unk}
 async function flush(){const r=await api("/api/flushdns",{});$("#bar").textContent=r.msg}
 const out=t=>$("#out").textContent=t;
-async function fix(){out("Applying fixes…");const r=await api("/api/fix",{});out("🔧 "+r.steps.join("\n🔧 ")+"\n\nRun the full check again to see if it helped.")}
-async function restore(){const r=await api("/api/restore",{});out("↩️ "+r.msgs.join("\n↩️ "))}
-async function loadProcs(){out("Looking at running apps…");const P=await api("/api/procs");out(P.length?"":"Can't list apps (psutil missing). Use the .exe or pip install psutil.");const t=$("#pr");t.replaceChildren();
- const hr=h("tr");["App","CPU %","RAM MB","Connections",""].forEach(x=>hr.append(h("th","",x)));t.append(hr);
- for(const p of P){const tr=h("tr"),td=h("td"),b=h("button","g","Boost this");b.style.padding="4px 10px";
-  b.onclick=async()=>{out("Boosting…");const r=await api("/api/boost",{pid:p.pid,pause:$("#pz").checked});out("⚡ "+r.msgs.join("\n⚡ "))};
-  td.append(b);tr.append(h("td","",p.name+(p.hog?"  ⚠️ background hog":"")),h("td","",p.cpu.toFixed(0)),h("td","",p.mem.toFixed(0)),h("td","",p.conns),td);t.append(tr)}}
+async function fix(){out("Applying fixes…");const r=await api("/api/fix",{});out(r.steps.map(x=>"- "+x).join("\n")+"\n\nRun the full check again to see if it helped.")}
+async function restore(){const r=await api("/api/restore",{});out(r.msgs.map(x=>"- "+x).join("\n"))}
+const STEPS=["Read WiFi signal","Ping router","Ping internet","Test DNS","Test download speed","Test upload speed","Scan devices","Check computer"];
+const NS="http://www.w3.org/2000/svg";
+function chart(el,sets,H){const W=600,m=Math.max(1,...sets.flat());el.replaceChildren();const sv=document.createElementNS(NS,"svg");sv.setAttribute("viewBox","0 0 "+W+" "+H);sv.setAttribute("preserveAspectRatio","none");sv.style.width="100%";sv.style.height=H+"px";
+ sets.forEach((a,k)=>{if(a.length<2)return;const pts=a.map((v,i)=>(i*W/(a.length-1)).toFixed(1)+","+(H-2-v/m*(H-6)).toFixed(1)).join(" ");
+  if(!k){const ar=document.createElementNS(NS,"polygon");ar.setAttribute("points","0,"+H+" "+pts+" "+W+","+H);ar.setAttribute("fill","currentColor");ar.setAttribute("opacity",".08");sv.append(ar)}
+  const pl=document.createElementNS(NS,"polyline");pl.setAttribute("points",pts);pl.setAttribute("fill","none");pl.setAttribute("stroke","currentColor");pl.setAttribute("stroke-width","2");pl.setAttribute("vector-effect","non-scaling-stroke");if(k)pl.setAttribute("stroke-dasharray","4 3");sv.append(pl)});el.append(sv)}
+function testUI(j){$("#tcard").hidden=!j.running;$("#res").classList.toggle("dim",!!j.running);if(!j.running)return;
+ const names=j.kind==="scan"?["Scan devices"]:STEPS,ul=$("#steps");if(ul.children.length!==names.length){ul.replaceChildren();names.forEach(n=>ul.append(h("li","",n)))}
+ [...ul.children].forEach((li,k)=>li.className=k<j.i?"done":k===j.i?"act":"");const L=j.live||{},on=L.phase;
+ $("#phase").textContent=on?(on==="download"?"Download":"Upload")+" speed":"Preparing";$("#liveval").textContent=on?L.mbps.toFixed(1):"--";chart($("#livechart"),[L.series||[]],90)}
+const AR={};
+function apps(A){const box=$("#apps"),seen=new Set(),top=Math.max(.5,...A.map(x=>x.mbps));
+ A.forEach((a,i)=>{seen.add(a.name);let r=AR[a.name];
+  if(!r){r=h("div","arow");r.n=h("div");const tr=h("div","track");r.f=h("div","fill");tr.append(r.f);r.m=h("div","am");r.c=h("div","ac");r.b=h("button","g","Boost");r.b.onclick=()=>boost(r.pid,r.nm);r.append(r.n,tr,r.m,r.c,r.b);AR[a.name]=r;box.append(r)}
+  r.pid=a.pid;r.nm=a.name;r.n.textContent=a.name+(a.hog?" (background)":"");r.f.style.width=Math.min(100,a.mbps/top*100)+"%";r.m.textContent=a.mbps.toFixed(1)+" Mbps";r.c.textContent=a.conns+" conn";r.style.order=i});
+ for(const k in AR)if(!seen.has(k)){AR[k].remove();delete AR[k]}}
+async function boost(pid,name){out("Boosting "+name+"...");const r=await api("/api/boost",{pid,pause:$("#pz").checked});out(r.msgs.map(x=>"- "+x).join("\n"))}
+async function live(){try{const r=await api("/api/live");if(!r.ok){$("#lnote").textContent="Install psutil (or use the .exe) to enable the live monitor and per-app allocation.";return}
+ const L=r.live;$("#ld").textContent=L.down.toFixed(1);$("#lu").textContent=L.up.toFixed(1);chart($("#lchart"),[L.hist.map(x=>x[0]),L.hist.map(x=>x[1])],110);apps(L.apps)}catch(e){}}
+setInterval(live,1500);live();
+$("#target").addEventListener("keydown",e=>{if(e.key==="Enter")run("full")});
 setInterval(()=>api("/api/ping"),5000);
 </script></body></html>"""
 
@@ -420,7 +516,7 @@ if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="WiFi Fixer")
     ap.add_argument("--port", type=int, default=PORT); ap.add_argument("--no-window", action="store_true", help="don't open the app window")
-    A = ap.parse_args(); PORT = A.port
+    A = ap.parse_args(); PORT = A.port; threading.Thread(target=sampler, daemon=True).start()
     try: srv = ThreadingHTTPServer(("127.0.0.1", PORT), H)
     except OSError: open_app(f"http://localhost:{PORT}"); raise SystemExit
     print(f"WiFi Fixer running at http://localhost:{PORT}  (Ctrl+C to quit)")

@@ -23,6 +23,8 @@ Using a Mac or Linux? See [Mac and Linux](#mac-and-linux) below.
 - **Fix it for me.** One button that clears your DNS cache, renews your IP address, and switches to faster DNS when yours is slow.
 - **See who is on your WiFi.** Lists every connected device. Mark your own with "That's mine". Anything else shows as Unknown, and brand-new devices are marked NEW.
 - **Boost a download.** Pick the app that is downloading. It gets high priority, background sync and update apps (OneDrive, Dropbox, Steam and similar) are paused, and other heavy apps are slowed down. Click "Restore everything" when you are done.
+- **Live network monitor.** Watch your real download and upload speed second by second, and watch the speed test run live with a progress checklist.
+- **Network allocation by app.** See which apps are using your connection right now, with a bar for each. Windows does not give exact per-app numbers, so these are estimates.
 - **History and reports.** See your speed over time and save a text report to send to your internet provider.
 
 ## How to use it
@@ -30,7 +32,7 @@ Using a Mac or Linux? See [Mac and Linux](#mac-and-linux) below.
 1. Type the speed you should be getting (for example 100) and click **Run full check**. It takes about 30 seconds.
 2. Read the **Diagnosis**. Every problem comes with a suggested fix. Click **Fix it for me** to apply the automatic ones.
 3. Look at **Devices on your WiFi** and click **That's mine** next to each device you recognise. Anything left over is worth checking.
-4. Downloading something big? Scroll to **Boost a download**, click **Show running apps**, then click **Boost this** next to the app that is downloading.
+4. Downloading something big? Scroll to **Network allocation by app** and click **Boost** next to the app that is downloading.
 
 ## What the results mean
 
